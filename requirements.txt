@@ -1,0 +1,8 @@
+faster-whisper
+sounddevice
+numpy
+pyaudio; platform_system == "Windows"  # optional; sounddevice preferred
+keyboard
+pyperclip
+PySide6 # or Tkinter (builtin) – using PySide for nicer overlay
+loguru
