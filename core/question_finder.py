@@ -95,7 +95,6 @@ class QuestionFinder:
         s = re.sub(r"\s+", " ", s)
         return s.strip()
 
-
     def _looks_like_question(self, s: str) -> bool:
         if not s:
             return False
@@ -103,7 +102,7 @@ class QuestionFinder:
         raw = s.strip()
         lower = raw.lower()
 
-        # obvious: explicit '?'
+        # explicit '?'
         if "?" in raw:
             return True
 
@@ -121,7 +120,7 @@ class QuestionFinder:
         if first in QUESTION_WORDS:
             return True
 
-        # heuristic: ends with "right", "correct", etc. AND contains "you"
+        # heuristic: trailing "right/correct/okay" with "you"
         if any(lower.endswith(end) for end in [" right", " correct", " yeah", " okay"]):
             if "you" in tokens or "your" in tokens:
                 return False
@@ -129,7 +128,6 @@ class QuestionFinder:
         # filter explanatory "X is Y, right?" with no 'you/your'
         if lower.endswith(" right") and "you" not in tokens and "your" not in tokens:
             return False
-
 
         return False
 
@@ -161,34 +159,22 @@ class QuestionFinder:
             if not self._looks_like_question(cand):
                 continue
 
-
             norm = self._normalize_question(cand)
             if not norm:
                 continue
 
             word_count = len(norm.split())
-            # require at least 5 words (avoids "What have you seen?")
+            # require at least 5 words, at most 40
             if word_count < 5 or word_count > 40:
                 continue
 
-            # aggressive dedupe: substring / superstring
+            # dedupe: substring / superstring similarity on normalized form
             duplicate = False
             for seen in self.seen_questions:
                 if norm in seen or seen in norm:
                     duplicate = True
                     break
             if duplicate:
-                continue
-
-            self.seen_questions.add(norm)
-            new_questions.append(cand.strip())
-
-            # length filter
-            word_count = len(norm.split())
-            if word_count < 4 or word_count > 40:
-                continue
-
-            if norm in self.seen_questions:
                 continue
 
             self.seen_questions.add(norm)

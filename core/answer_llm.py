@@ -1,11 +1,10 @@
 # core/answer_llm.py
 
-from openai import OpenAI
 import yaml
 import os
-
-import dotenv
-dotenv.load_dotenv(dotenv_path="config/.env")
+from core.llm.ollama_client import generate_answer
+from core.answer_retriever import AnswerRetriever  # NEW
+# (projects.yaml is still loaded locally here; project.py can be used elsewhere if you want)
 
 
 def classify_question_intent(q: str) -> str:
@@ -68,7 +67,7 @@ def classify_question_intent(q: str) -> str:
         "why do you want to join",
         "why do you want this role",
         "why are you interested in this position",
-        "why should we hire you",               # close enough to motivation
+        "why should we hire you",
         "why should we give this job to you",
         "why should we hire you and not someone else",
     ]
@@ -94,12 +93,33 @@ def classify_question_intent(q: str) -> str:
         "with a deadline",
         "in charge of a project",
     ]
+
     if any(p in q for p in behavioral_patterns):
+        return "behavioral_project"
+
+    # Generic “tell me about a project” → treat as behavioral_project
+    if "project" in q and any(p in q for p in [
+        "end-to-end",
+        "end to end",
+        "mlops",
+        "devops",
+        "specific project you worked on",
+        "project you worked on",
+        "end-to-end mlops",
+        "end-to-end devops",
+        "devops project",
+        "mlops project",
+        "devops project you worked on",
+        "mlops project you worked on",
+        "devops pipeline you worked on",
+        "mlops pipeline you worked on",
+    ]):
         return "behavioral_project"
 
     return "generic"
 
-# ---------- Project loader + picker ----------
+
+# ---------- Project loader + picker (local copy, fine for now) ----------
 
 def _load_projects_from_yaml(path: str):
     """Load projects list from projects.yaml. Returns [] on failure."""
@@ -254,13 +274,14 @@ def build_project_answer_prompt(question: str, project: dict) -> str:
 
         Instructions:
         - Build the answer internally using STAR structure (Situation, Task, Action, Result),
-        but DO NOT write the words “Situation”, “Task”, “Action”, or “Result” anywhere.
-        - Use 4–6 clean bullet points.
+          but DO NOT write the words “Situation”, “Task”, “Action”, or “Result” anywhere.
+        - Answer ONLY as 4–6 clean bullet points.
         - Each bullet should be a single, clear, spoken-interview-friendly sentence.
-        - No headings, no labels, no bold markers.
+        - Bullets may start with a short title followed by a colon, e.g. "Planning: ...".
+        - Do NOT use any markdown formatting (no bold, italics, or code).
         - Do NOT restate the question.
         - Do NOT invent any timeline, year, or date.
-        - Do NOT invent details not in the project description.
+        - Do NOT invent details that contradict or wildly exceed the project description.
     """
 
 
@@ -288,11 +309,14 @@ def build_behavioral_followup_prompt(question: str, project: dict, previous_answ
 
     Instructions:
     - Answer ONLY what the follow-up is asking (no re-explaining the whole project).
+    - Use exactly this project from my experience and do NOT switch to any other.
     - Use 2–4 sharp, direct bullet points.
-    - DO NOT introduce new problems, new incidents, or new timelines.
-    - DO NOT restate the question.
-    - DO NOT use the words “Situation”, “Task”, “Action”, or “Result”.
-    - DO NOT invent years or dates.
+    - Bullets may start with a short title followed by a colon, e.g. "Deadline plan: ...".
+    - Do NOT use any markdown formatting (no bold, italics, or code).
+    - Do NOT introduce new unrelated incidents, big new systems, or new timelines.
+    - Do NOT restate the question.
+    - Do NOT use the words “Situation”, “Task”, “Action”, or “Result”.
+    - Do NOT invent years or dates.
     """
 
 
@@ -303,7 +327,6 @@ def _is_behavioral_followup(question: str, last_intent: str | None) -> bool:
 
     q = question.lower().strip()
 
-    # Very generic fragments / follow-up style wordings we saw in logs
     patterns = [
         "when was it",
         "which was the outcome",
@@ -313,7 +336,7 @@ def _is_behavioral_followup(question: str, last_intent: str | None) -> bool:
         "and how was it resolved",
         "and which was the outcome",
         "okay, so tell me about the time",
-        "tell me about the time",  # as standalone follow-up
+        "tell me about the time",
         "and what did you do",
         "and how did you meet the deadline",
         "how did you meet the deadline",
@@ -350,8 +373,9 @@ class AnswerEngine:
         projects_path = os.path.join(base_dir, "data", "projects.yaml")
         self.projects = _load_projects_from_yaml(projects_path)
 
-        # init OpenAI client
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        # answer bank (built from past sessions by tools/build_answer_bank.py)
+        answer_bank_path = os.path.join(base_dir, "data", "answer_bank.jsonl")
+        self.answer_retriever = AnswerRetriever(answer_bank_path)
 
         # simple session state for follow-ups
         self.last_question: str | None = None
@@ -360,63 +384,51 @@ class AnswerEngine:
         self.last_behavioral_answer: list[str] | None = None
 
         # system prompt WITHOUT JD: default for most questions
-        self.system_prompt_general = f"""
-            You are helping Anmol in a live MLOps/DevOps interview.
-            Answer ONLY in 3–6 sharp bullet points.
-            Answer in first person, as Anmol.
+        self.system_prompt_general = """
+                You are helping Anmol in a live MLOps/DevOps interview.
+                Answer ONLY in 3–6 sharp bullet points.
+                Answer in first person, as Anmol.
 
-            Use ONLY information that is consistent with the resume below.
-            If something is not clearly supported by it, stay generic
-            instead of inventing tools, services or companies.
+                Use ONLY information that is consistent with the resume and job description below.
+                If something is not clearly supported by them, stay generic
+                instead of inventing tools, services or companies.
 
-            ROLE:
-            {self.role}
+                ROLE:
+                {self.role}
 
-            RESUME:
-            {self.resume_text}
+                RESUME:
+                {self.resume_text}
 
-            Rules:
-            - Do NOT restate the question.
-            - Do NOT invent random tech I haven't actually used.
-            - Prefer AWS, Terraform, Kubernetes, CI/CD, monitoring, drift detection,
-              Airflow, PySpark, etc. ONLY if they appear in my background.
-            - For 'tell me about yourself' / 'what have you studied' questions,
-              include education and key experience.
-            - Keep bullets short (ideally 12–20 words).
-        """
+                JOB DESCRIPTION:
+                {self.jd_text}
 
-        # system prompt WITH JD: only for why-company / motivation style questions
-        self.system_prompt_with_jd = f"""
-            You are helping Anmol in a live MLOps/DevOps interview.
-            Answer ONLY in 3–6 sharp bullet points.
-            Answer in first person, as Anmol.
-
-            Use ONLY information that is consistent with the resume and job description below.
-            If something is not clearly supported by them, stay generic
-            instead of inventing tools, services or companies.
-
-            ROLE:
-            {self.role}
-
-            RESUME:
-            {self.resume_text}
-
-            JOB DESCRIPTION:
-            {self.jd_text}
-
-            Rules:
-            - Do NOT restate the question.
-            - Do NOT invent random tech I haven't actually used.
-            - You MAY refer to the company’s domain, products, or responsibilities
-              only when explaining why I am a good fit for THIS ROLE or why I want
-              to work at THIS COMPANY.
-            - Keep bullets short (ideally 12–20 words).
-        """
-
-
+                Rules:
+                - Do NOT restate the question.
+                - Do NOT invent random tech I haven't actually used.
+                - Do NOT use any markdown formatting (no bold, italics, or code).
+                - You MAY refer to the company’s domain, products, or responsibilities
+                only when explaining why I am a good fit for THIS ROLE or why I want
+                to work at THIS COMPANY.
+                - Keep bullets short (ideally 12–20 words).
+            """
 
     def generate_answer(self, question: str):
         q = question.strip()
+
+        # 0) Try to reuse from answer bank first
+        reused = None
+        if self.answer_retriever is not None:
+            reused = self.answer_retriever.find_best(q, threshold=0.82)
+
+        if reused is not None:
+            bullets, matched_q, score = reused
+            print(f"[DEBUG] Reusing answer from history (score={score:.2f}) for question similar to: {matched_q!r}")
+            self.last_question = q
+            self.last_intent = classify_question_intent(matched_q)
+            # behavioral project context won't be set here, that's fine
+            return bullets
+
+        # 1) Normal fresh path
         base_intent = classify_question_intent(q)
 
         # Decide if this is a behavioral follow-up
@@ -439,7 +451,6 @@ class AnswerEngine:
             ]):
                 intent = "weaknesses"
 
-
         # For behavioral follow-ups, force a special path
         if is_followup and self.projects:
             intent = "behavioral_followup"
@@ -459,113 +470,99 @@ class AnswerEngine:
             if self.last_behavioral_answer:
                 prev_text = "\n".join(f"- {b}" for b in self.last_behavioral_answer)
             user_msg = build_behavioral_followup_prompt(q, project, prev_text)
-            
 
         else:
             base = f"Question: {q}\n"
 
             if intent == "intro":
                 user_msg = base + (
-                "Answer as a short professional self-introduction: 4–5 bullets.\n"
-                "Format: **ShortTitle:** description.\n"
-                "- Current role & years.\n"
-                "- Core tech stack.\n"
-                "- Education.\n"
-                "- Value you bring.\n"
-            )
-
+                    "Answer as a short professional self-introduction: 4–5 bullets.\n"
+                    "- Start each bullet with a short title and colon, e.g. 'Current role: ...'.\n"
+                    "- Do NOT use any markdown formatting (no bold, italics, or code).\n"
+                    "- Cover current role, core stack, education, and value.\n"
+                )
 
             elif intent == "education":
                 user_msg = base + (
-                "Focus on education in 3–4 bullets.\n"
-                "Format: **ShortTitle:** description.\n"
-                "- Degrees.\n"
-                "- Key subjects.\n"
-                "- Certifications.\n"
-            )
-
+                    "Focus on education in 3–4 bullets.\n"
+                    "- Start each bullet with a short title and colon, e.g. 'M.Tech: ...'.\n"
+                    "- Do NOT use any markdown formatting.\n"
+                )
 
             elif intent == "experience":
                 user_msg = base + (
                     "Summarise your experience in 3–5 bullets.\n"
-                    "Format: **ShortTitle:** description.\n"
+                    "- Start each bullet with a short title and colon, e.g. 'Platform work: ...'.\n"
+                    "- Do NOT use any markdown formatting.\n"
                 )
 
             elif intent == "strengths":
                 user_msg = base + (
                     "List 3–5 strengths.\n"
-                    "Format: **StrengthName:** how it helps the role.\n"
+                    "- Each bullet: 'Strength name: how it helps the role'.\n"
+                    "- Do NOT use any markdown formatting.\n"
                 )
 
             elif intent == "weaknesses":
                 user_msg = base + (
                     "List real but safe development areas.\n"
-                    "Format: **WeaknessName:** what you’re doing to improve it.\n"
+                    "- Each bullet: 'Area: what you are doing to improve it'.\n"
+                    "- Do NOT use any markdown formatting.\n"
                 )
-
-
 
             elif intent == "why_company":
                 user_msg = base + (
                     "Answer why you applied for this role and why you want to work at this company.\n"
                     "Use the job description context above for alignment, but do NOT copy sentences.\n"
-                    "Format: **Stage:** explanation.\n"
+                    "- Start each bullet with a short title and colon, e.g. 'Role fit: ...'.\n"
                     "- 1 bullet: what attracts you to the company/domain or team (based on JD).\n"
                     "- 2 bullets: how your past work (DevOps/MLOps/platform) matches what they need.\n"
                     "- 1 bullet: what value you will bring (impact, reliability, scalability, cost, etc.).\n"
                     "- 1 bullet: what you want to learn or grow into in this role.\n"
-                    "Keep it specific to this company/role, not generic MLOps boilerplate."
+                    "- Do NOT use any markdown formatting.\n"
                 )
 
             elif intent == "llm_basics":
                 user_msg = base + (
                     "Explain what a Large Language Model (LLM) is.\n"
                     "Give 3–5 bullets.\n"
-                    "Format: **Stage:** description.\n"
-                    "- 1 bullet: simple definition.\n"
-                    "- 1 bullet: how transformers/attention work (high-level).\n"
-                    "- 1 bullet: why LLMs are useful for automation / NLP.\n"
-                    "- 1 bullet: tie to MLOps or deployment if relevant.\n"
+                    "- Each bullet starts with a short title and colon, e.g. 'Definition: ...'.\n"
+                    "- Do NOT use any markdown formatting.\n"
                 )
 
             elif intent == "ml_pipeline":
                 user_msg = base + (
                     "Explain an end-to-end ML pipeline in 3–6 clear bullets.\n"
-                    "Structure should cover:\n"
-                    "Format: **KeyPoint:** description.\n"
-                    "- Data ingestion + preprocessing.\n"
-                    "- Feature engineering.\n"
-                    "- Model training + evaluation.\n"
-                    "- CI/CD for ML (model versioning, deployment, testing).\n"
-                    "- Monitoring + retraining strategy.\n"
-                    "Use AWS/Terraform/Kubernetes examples ONLY if consistent with my resume."
+                    "Structure should cover data, training, deployment, and monitoring.\n"
+                    "- Each bullet starts with a short title and colon, e.g. 'Data pipeline: ...'.\n"
+                    "- Do NOT use any markdown formatting.\n"
+                    "Use AWS/Terraform/Kubernetes examples ONLY if consistent with my resume.\n"
                 )
 
-            elif intent == "drift":  # if you fully removed drift, delete this branch entirely
+            elif intent == "drift":
                 user_msg = base + (
-                    "Format: **KeyPoint:** description.\n"
                     "Explain clearly how you detect and handle data/model drift in production.\n"
-                    "3–5 bullets, concrete techniques and tools."
+                    "3–5 bullets, concrete techniques and tools.\n"
+                    "- Each bullet starts with a short title and colon.\n"
+                    "- Do NOT use any markdown formatting.\n"
                 )
 
-            elif intent == "ml_basics":  # if you kept the old 'ml_basics' name separately
+            elif intent == "ml_basics":
                 user_msg = base + (
-                    "Format: **KeyPoint:** description.\n"
                     "Explain 'what is machine learning and why is it important'.\n"
-                    "Give 3–5 bullets, high level theory plus one MLOps angle."
+                    "Give 3–5 bullets, high level theory plus one MLOps angle.\n"
+                    "- Each bullet starts with a short title and colon.\n"
+                    "- Do NOT use any markdown formatting.\n"
                 )
 
             else:
                 # Generic fallback: answer the question directly, no boilerplate
                 user_msg = base + (
-                    "Format: **KeyPoint:** description.\n"
                     "Answer this question directly in 3–5 short bullet points.\n"
-                    "- Focus only on what the question is actually asking.\n"
-                    "- Do NOT just list generic responsibilities or MLOps buzzwords.\n"
-                    "- Use concrete examples from your experience only if they clearly fit the question.\n"
-                    "- If the question is vague, give a reasonable, honest interpretation."
+                    "EACH bullet MUST be exactly one line in this format:\n"
+                    "- ShortTitle: description\n"
+                    "Do NOT split titles and descriptions into separate lines.\n"
                 )
-
 
 
         try:
@@ -575,18 +572,13 @@ class AnswerEngine:
             else:
                 system_prompt = self.system_prompt_general
 
-            resp = self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_msg},
-                ],
-                max_tokens=220,
-                temperature=0.3,
-            )
+            print(f"[DEBUG] Sending to LLM. intent={intent}, q={q!r}")
+            text = generate_answer(system_prompt, user_msg)
+            print(f"[DEBUG] LLM returned {len(text)} chars")
 
-            text = resp.choices[0].message.content.strip()
+            text = text.strip()
 
+            # Extract bullets
             bullets = []
             for line in text.split("\n"):
                 line = line.strip()
@@ -601,19 +593,8 @@ class AnswerEngine:
             self.last_intent = intent
 
             if intent in ("behavioral_project", "behavioral_followup"):
-                # Store the project used for this behavioral chain
-                if self.last_intent == "behavioral_project" and self.last_project is not None:
-                    # This is a follow-up to the same project
-                    last_answer_text = "\n".join(self.last_answer_bullets)
-                    user_msg = build_behavioral_followup_prompt(q, self.last_project, last_answer_text)
-                else:
-                    # first behavioral question
-                    project = pick_best_project(q, self.projects)
-                    self.last_project = project
-                    user_msg = build_project_answer_prompt(q, project)
                 self.last_behavioral_project = project
                 self.last_behavioral_answer = bullets
-            
 
             return bullets
 

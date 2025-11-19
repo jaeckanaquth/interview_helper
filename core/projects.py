@@ -1,3 +1,5 @@
+# core/project.py
+
 import os
 import yaml
 from difflib import SequenceMatcher
@@ -60,7 +62,6 @@ def classify_behavior_tags(question: str) -> list:
 
     # FALLBACK: if it's clearly generic “tell me about a project”
     if not tags and any(w in q for w in ["project", "situation", "example", "experience"]):
-        # bias toward your main DevOps platform
         tags.append("ownership")
         tags.append("deadline")
 
