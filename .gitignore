@@ -4,4 +4,6 @@ data/*
 # config
 config/*
 
+# vs code files
 *__pycache__*
+*.code-workspace*
