@@ -54,7 +54,6 @@ def classify_question_intent(q: str) -> str:
     ]):
         return "ml_pipeline"
 
-    # Why this job / why this company / why here
     why_patterns = [
         "why do you want to work here",
         "why do you want to work for",
@@ -383,50 +382,68 @@ class AnswerEngine:
         self.last_behavioral_project: dict | None = None
         self.last_behavioral_answer: list[str] | None = None
 
-        # system prompt WITHOUT JD: default for most questions
-        self.system_prompt_general = """
-                You are helping Anmol in a live MLOps/DevOps interview.
-                Answer ONLY in 3–6 sharp bullet points.
-                Answer in first person, as Anmol.
+        # system prompts — FORMAT properly so placeholders are injected
+        # General prompt: use resume/jd if present but do NOT block answering if missing.
+        self.system_prompt_general = f"""
+You are helping Anmol in a live MLOps/DevOps interview.
+Answer ONLY in 3–6 sharp bullet points.
+Answer in first person, as Anmol.
 
-                Use ONLY information that is consistent with the resume and job description below.
-                If something is not clearly supported by them, stay generic
-                instead of inventing tools, services or companies.
+Role:
+{self.role}
 
-                ROLE:
-                {self.role}
+Resume (if available):
+{self.resume_text[:4000]}
 
-                RESUME:
-                {self.resume_text}
+Job description (if available — use for alignment; if not present, do not refuse):
+{self.jd_text[:4000]}
 
-                JOB DESCRIPTION:
-                {self.jd_text}
+Rules:
+- Do NOT restate the question.
+- Do NOT invent tools or experience that contradict the resume.
+- Keep bullets short (ideally 12–20 words).
+- Do NOT use markdown formatting.
+If the question requests personal documents or ID, politely refuse and steer to role-relevant answers.
+"""
 
-                Rules:
-                - Do NOT restate the question.
-                - Do NOT invent random tech I haven't actually used.
-                - Do NOT use any markdown formatting (no bold, italics, or code).
-                - You MAY refer to the company’s domain, products, or responsibilities
-                only when explaining why I am a good fit for THIS ROLE or why I want
-                to work at THIS COMPANY.
-                - Keep bullets short (ideally 12–20 words).
-            """
+        # system prompt variant for JD-heavy responses (why_company). include JD explicitly
+        self.system_prompt_with_jd = f"""
+You are helping Anmol in a live interview. Use the resume and job description below to align answers.
+
+Role: {self.role}
+
+Resume excerpt:
+{self.resume_text[:4000]}
+
+Job description:
+{self.jd_text[:4000]}
+
+Instructions:
+- Answer in 3–6 concise bullets in first person.
+- Align reasons / fit to the job description when asked why_company.
+- Do NOT invent facts contradicting resume or JD.
+- If JD is missing, still answer but mark alignment as 'based on role description' implicitly.
+"""
 
     def generate_answer(self, question: str):
         q = question.strip()
 
-        # 0) Try to reuse from answer bank first
+        # 0) Try to reuse from answer bank first — but only for very close matches
         reused = None
         if self.answer_retriever is not None:
-            reused = self.answer_retriever.find_best(q, threshold=0.82)
-
-        if reused is not None:
-            bullets, matched_q, score = reused
-            print(f"[DEBUG] Reusing answer from history (score={score:.2f}) for question similar to: {matched_q!r}")
-            self.last_question = q
-            self.last_intent = classify_question_intent(matched_q)
-            # behavioral project context won't be set here, that's fine
-            return bullets
+            # require a tight match; answer_retriever now returns overlap too
+            found = self.answer_retriever.find_best(q, threshold=0.95)
+            if found:
+                bullets, matched_q, score, overlap = found
+                # extra protection: only reuse when both similarity and token overlap are strong
+                if score >= 0.95 and overlap >= 0.45:
+                    print(f"[DEBUG] Reusing answer from history (score={score:.2f}, overlap={overlap:.2f}) for question similar to: {matched_q!r}")
+                    self.last_question = q
+                    self.last_intent = classify_question_intent(matched_q)
+                    return bullets
+                else:
+                    # do NOT reuse; we could use as suggestion, but prefer fresh generation
+                    print(f"[DEBUG] Candidate historical match found (score={score:.2f}, overlap={overlap:.2f}) but below reuse criteria - generating fresh answer.")
 
         # 1) Normal fresh path
         base_intent = classify_question_intent(q)
@@ -455,6 +472,10 @@ class AnswerEngine:
         if is_followup and self.projects:
             intent = "behavioral_followup"
 
+        # Protect against personal/document requests
+        if any(tok in q.lower() for tok in ["id proof", "id card", "passport", "show me your id", "scan of id"]):
+            return ["I cannot provide ID or personal documents. Please ask role- or project-related questions."]
+
         # Build user_msg based on intent
         project = None
         user_msg = ""
@@ -478,7 +499,6 @@ class AnswerEngine:
                 user_msg = base + (
                     "Answer as a short professional self-introduction: 4–5 bullets.\n"
                     "- Start each bullet with a short title and colon, e.g. 'Current role: ...'.\n"
-                    "- Do NOT use any markdown formatting (no bold, italics, or code).\n"
                     "- Cover current role, core stack, education, and value.\n"
                 )
 
@@ -486,28 +506,24 @@ class AnswerEngine:
                 user_msg = base + (
                     "Focus on education in 3–4 bullets.\n"
                     "- Start each bullet with a short title and colon, e.g. 'M.Tech: ...'.\n"
-                    "- Do NOT use any markdown formatting.\n"
                 )
 
             elif intent == "experience":
                 user_msg = base + (
                     "Summarise your experience in 3–5 bullets.\n"
                     "- Start each bullet with a short title and colon, e.g. 'Platform work: ...'.\n"
-                    "- Do NOT use any markdown formatting.\n"
                 )
 
             elif intent == "strengths":
                 user_msg = base + (
                     "List 3–5 strengths.\n"
                     "- Each bullet: 'Strength name: how it helps the role'.\n"
-                    "- Do NOT use any markdown formatting.\n"
                 )
 
             elif intent == "weaknesses":
                 user_msg = base + (
                     "List real but safe development areas.\n"
                     "- Each bullet: 'Area: what you are doing to improve it'.\n"
-                    "- Do NOT use any markdown formatting.\n"
                 )
 
             elif intent == "why_company":
@@ -519,7 +535,6 @@ class AnswerEngine:
                     "- 2 bullets: how your past work (DevOps/MLOps/platform) matches what they need.\n"
                     "- 1 bullet: what value you will bring (impact, reliability, scalability, cost, etc.).\n"
                     "- 1 bullet: what you want to learn or grow into in this role.\n"
-                    "- Do NOT use any markdown formatting.\n"
                 )
 
             elif intent == "llm_basics":
@@ -527,7 +542,6 @@ class AnswerEngine:
                     "Explain what a Large Language Model (LLM) is.\n"
                     "Give 3–5 bullets.\n"
                     "- Each bullet starts with a short title and colon, e.g. 'Definition: ...'.\n"
-                    "- Do NOT use any markdown formatting.\n"
                 )
 
             elif intent == "ml_pipeline":
@@ -535,7 +549,6 @@ class AnswerEngine:
                     "Explain an end-to-end ML pipeline in 3–6 clear bullets.\n"
                     "Structure should cover data, training, deployment, and monitoring.\n"
                     "- Each bullet starts with a short title and colon, e.g. 'Data pipeline: ...'.\n"
-                    "- Do NOT use any markdown formatting.\n"
                     "Use AWS/Terraform/Kubernetes examples ONLY if consistent with my resume.\n"
                 )
 
@@ -544,7 +557,6 @@ class AnswerEngine:
                     "Explain clearly how you detect and handle data/model drift in production.\n"
                     "3–5 bullets, concrete techniques and tools.\n"
                     "- Each bullet starts with a short title and colon.\n"
-                    "- Do NOT use any markdown formatting.\n"
                 )
 
             elif intent == "ml_basics":
@@ -552,7 +564,6 @@ class AnswerEngine:
                     "Explain 'what is machine learning and why is it important'.\n"
                     "Give 3–5 bullets, high level theory plus one MLOps angle.\n"
                     "- Each bullet starts with a short title and colon.\n"
-                    "- Do NOT use any markdown formatting.\n"
                 )
 
             else:
@@ -563,7 +574,6 @@ class AnswerEngine:
                     "- ShortTitle: description\n"
                     "Do NOT split titles and descriptions into separate lines.\n"
                 )
-
 
         try:
             # choose system prompt based on intent

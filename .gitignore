@@ -5,5 +5,7 @@ data/*
 config/*
 
 # vs code files
-*__pycache__*
+**/__pycache__/**
+**/*.pyc
+**/__pycache__
 *.code-workspace*

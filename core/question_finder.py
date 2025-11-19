@@ -11,8 +11,6 @@ QUESTION_WORDS = {
     "have", "has", "had",
     "should", "shall", "may", "might",
 }
-# (notice: no "will")
-
 
 QUESTION_PHRASES = [
     "tell me about",
@@ -33,10 +31,26 @@ QUESTION_PHRASES = [
     "explain the time when",
 ]
 
-# filler at the beginning we want to strip for normalization
 LEADING_FILLERS = [
     "so", "okay", "ok", "right", "well", "alright", "yeah", "look",
-    "so uh", "so um", "so like",
+    "so uh", "so um", "so like", "um", "uh",
+]
+
+# Meeting noise and obvious non-interview chatter to ignore
+IGNORED_PATTERNS = [
+    r"\bgive me a minute\b",
+    r"\bjoin in a minute\b",
+    r"\bplease show me your id\b",
+    r"\bshow me your id\b",
+    r"\bshow me your id proof\b",
+    r"\bcan you show me your id\b",
+    r"\b(on mute|you are on mute)\b",
+    r"\bwill be joining\b",
+    r"\bfollow question\b",
+    r"\bfollow up\b",
+    r"\bthanks\b",
+    r"\bthank you\b",
+    r"\bwe will be\b",
 ]
 
 
@@ -61,13 +75,11 @@ class QuestionFinder:
         s = re.sub(r"[?!.\s]+$", "", s)
         s = s.lower()
 
-        # strip “let's start with our first question…” boilerplate
+        # strip common boilerplate
         boilerplate_patterns = [
             r"^so\s+let'?s\s+begin\s+with\s+our\s+very\s+first\s+question\s+which\s+is\s+",
             r"^so\s+let'?s\s+begin\s+with\s+our\s+first\s+question\s+which\s+is\s+",
-            r"^so\s+let'?s\s+begin\s+with\s+the\s+first\s+question\s+which\s+is\s+",
             r"^let'?s\s+begin\s+with\s+our\s+very\s+first\s+question\s+which\s+is\s+",
-            r"^let'?s\s+begin\s+with\s+the\s+first\s+question\s+which\s+is\s+",
             r"^let'?s\s+start\s+with\s+the\s+tell\s+me\s+about\s+yourself\s+question\s*",
         ]
         for pat in boilerplate_patterns:
@@ -75,8 +87,11 @@ class QuestionFinder:
 
         # strip leading fillers like "so", "okay", etc.
         for filler in LEADING_FILLERS:
-            pattern = r"^" + re.escape(filler) + r"\s+"
+            pattern = r"^" + re.escape(filler) + r"[\s,]+"
             s = re.sub(pattern, "", s)
+
+        # collapse repeated filler tokens and repeated words
+        s = re.sub(r'\b(\w+)( \1){2,}\b', r'\1', s)
 
         # keep from the first question word onwards
         tokens = s.split()
@@ -102,6 +117,11 @@ class QuestionFinder:
         raw = s.strip()
         lower = raw.lower()
 
+        # ignore obvious meeting chatter / commands
+        for pat in IGNORED_PATTERNS:
+            if re.search(pat, lower):
+                return False
+
         # explicit '?'
         if "?" in raw:
             return True
@@ -118,14 +138,14 @@ class QuestionFinder:
 
         first = tokens[0]
         if first in QUESTION_WORDS:
-            return True
+            # require at least a verb or a question word + noun to avoid short fragments
+            if len(tokens) >= 5:
+                return True
+            # short questions like "Can you explain X?" are OK if they contain a verb after the first token
+            if len(tokens) >= 3 and any(t in tokens for t in ["explain", "describe", "show", "tell", "walk", "do", "did", "have", "has"]):
+                return True
 
-        # heuristic: trailing "right/correct/okay" with "you"
-        if any(lower.endswith(end) for end in [" right", " correct", " yeah", " okay"]):
-            if "you" in tokens or "your" in tokens:
-                return False
-
-        # filter explanatory "X is Y, right?" with no 'you/your'
+        # filter explanatory "X is Y, right?" with no 'you/your' (likely not an interview question)
         if lower.endswith(" right") and "you" not in tokens and "your" not in tokens:
             return False
 
@@ -152,8 +172,8 @@ class QuestionFinder:
         new_questions: List[str] = []
 
         for cand in candidates:
+            # skip tiny fragments
             if len(cand.split()) < 4:
-                # too short to be a real interview question (most of the time)
                 continue
 
             if not self._looks_like_question(cand):
@@ -164,8 +184,8 @@ class QuestionFinder:
                 continue
 
             word_count = len(norm.split())
-            # require at least 5 words, at most 40
-            if word_count < 5 or word_count > 40:
+            # require at least 5 words, at most 50
+            if word_count < 5 or word_count > 50:
                 continue
 
             # dedupe: substring / superstring similarity on normalized form

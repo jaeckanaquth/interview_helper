@@ -79,25 +79,23 @@ def parse_qa_markdown(path: str) -> List[Dict]:
     return qa_pairs
 
 
-def main():
-    base_dir = os.path.join("data", "sessions")
-    pattern = os.path.join(base_dir, "*", "qa_log.md")
-    paths = glob.glob(pattern)
+base_dir = os.path.join("data", "sessions")
+pattern = os.path.join(base_dir, "*", "qa_log.md")
+paths = glob.glob(pattern)
 
-    all_pairs: List[Dict] = []
-    print(f"[INFO] Found {len(paths)} qa_log.md files")
-    for p in sorted(paths):
-        all_pairs.extend(parse_qa_markdown(p))
-        print(f"[INFO] Parsed {len(all_pairs)} Q&A pairs from {p}")
-    out_path = os.path.join("data", "answer_bank.jsonl")
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+all_pairs: List[Dict] = []
+print(f"[INFO] Found {len(paths)} qa_log.md files")
+for p in sorted(paths):
+    parsed = parse_qa_markdown(p)        # pairs for this file
+    all_pairs.extend(parsed)
+    # print per-file and cumulative counts
+    print(f"[INFO] Parsed {len(parsed)} Q&A pairs from {p} (cumulative: {len(all_pairs)})")
+out_path = os.path.join("data", "answer_bank.jsonl")
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        for qa in all_pairs:
-            f.write(json.dumps(qa, ensure_ascii=False) + "\n")
+with open(out_path, "w", encoding="utf-8") as f:
+    for qa in all_pairs:
+        f.write(json.dumps(qa, ensure_ascii=False) + "\n")
 
-    print(f"[INFO] Extracted {len(all_pairs)} Q&A pairs into {out_path}")
+print(f"[INFO] Extracted {len(all_pairs)} Q&A pairs into {out_path}")
 
-
-if __name__ == "__main__":
-    main()
