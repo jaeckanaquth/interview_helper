@@ -3,3 +3,5 @@ data/*
 
 # config
 config/*
+
+*__pycache__*
